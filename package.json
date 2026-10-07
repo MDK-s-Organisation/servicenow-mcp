@@ -1,0 +1,12 @@
+{
+  "name": "servicenow-mcp",
+  "version": "0.1.0",
+  "description": "A small MCP server for ServiceNow: Table API and Attachment API over OAuth with PKCE. One file, no dependencies, read-only by default.",
+  "type": "module",
+  "bin": { "servicenow-mcp": "server.mjs" },
+  "scripts": { "start": "node server.mjs", "test": "node test/run-tests.mjs" },
+  "engines": { "node": ">=18" },
+  "keywords": ["mcp", "model-context-protocol", "servicenow", "claude"],
+  "repository": { "type": "git", "url": "git+https://github.com/MDK-s-Organisation/servicenow-mcp.git" },
+  "license": "MIT"
+}
