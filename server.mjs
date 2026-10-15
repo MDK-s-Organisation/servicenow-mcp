@@ -994,6 +994,175 @@ async function undoPlan(cfg, plan) {
 }
 
 // ---------------------------------------------------------------------------
+// Field checks while planning. They only read the dictionary, so a plan that
+// would fail or store something unexpected is caught before anyone reviews it.
+// ---------------------------------------------------------------------------
+
+const MAX_TABLE_DEPTH = 12;
+const LIST_LIMIT = 1000;
+
+async function listRows(cfg, table, query, fields) {
+  const { data } = await snJson(cfg, 'GET', `/api/now/table/${table}`, {
+    query: { sysparm_query: query, sysparm_fields: fields, sysparm_limit: LIST_LIMIT, sysparm_exclude_reference_link: 'true' },
+  });
+  return data && Array.isArray(data.result) ? data.result : [];
+}
+
+// The table and the tables it extends, nearest first, for example incident,
+// task. Null when sys_db_object cannot be read.
+async function tableChain(cfg, table) {
+  const chain = [table];
+  for (let i = 0; i < MAX_TABLE_DEPTH; i += 1) {
+    const [row] = await listRows(cfg, 'sys_db_object', `name=${chain[chain.length - 1]}`, 'name,super_class.name');
+    if (!row) return i === 0 ? null : chain;
+    const parent = asText(row['super_class.name']);
+    if (!parent || !TABLE_RE.test(parent) || chain.includes(parent)) break;
+    chain.push(parent);
+  }
+  return chain;
+}
+
+// Of several rows for the same element, the one on the nearest table wins,
+// the way a child table's definition wins over its parent's.
+function nearestByElement(rows, chain) {
+  const out = new Map();
+  for (const row of rows) {
+    const element = asText(row.element);
+    const depth = chain.indexOf(asText(row.name));
+    if (depth === -1) continue;
+    const seen = out.get(element);
+    if (!seen || depth < seen.depth) out.set(element, { depth, row });
+  }
+  return new Map([...out].map(([element, { row }]) => [element, row]));
+}
+
+// A column's definition with any override for this table applied.
+function definitionOf(column, override) {
+  const def = {
+    type: asText(column.internal_type),
+    reference: asText(column.reference),
+    mandatory: asText(column.mandatory) === 'true',
+    readOnly: asText(column.read_only) === 'true',
+    choice: asText(column.choice),
+    maxLength: Number(asText(column.max_length)) || 0,
+    defaultValue: asText(column.default_value),
+  };
+  if (override) {
+    if (asText(override.mandatory_override) === 'true') def.mandatory = asText(override.mandatory) === 'true';
+    if (asText(override.read_only_override) === 'true') def.readOnly = asText(override.read_only) === 'true';
+    if (asText(override.default_value_override) === 'true') def.defaultValue = asText(override.default_value);
+  }
+  return def;
+}
+
+// Choice values of one column, from the nearest table that defines any.
+async function choicesOf(cfg, chain, field) {
+  const rows = await listRows(cfg, 'sys_choice', `nameIN${chain.join(',')}^element=${field}^inactive=false`, 'name,value,label');
+  for (const table of chain) {
+    const own = rows.filter((row) => asText(row.name) === table);
+    if (own.length) {
+      const choices = new Map();
+      for (const row of own) if (!choices.has(asText(row.value))) choices.set(asText(row.value), asText(row.label));
+      return choices;
+    }
+  }
+  return null;
+}
+
+async function recordExists(cfg, table, sysId) {
+  try {
+    await snJson(cfg, 'GET', `/api/now/table/${table}/${sysId}`, { query: { sysparm_fields: 'sys_id' } });
+    return true;
+  } catch (err) {
+    if (err instanceof ToolError && err.status === 404) return false;
+    if (err instanceof ToolError && !err.auth && !err.network) return null; // cannot tell
+    throw err;
+  }
+}
+
+// Check planned values against the dictionary. Returns warnings to show with
+// the plan, and the columns that do not exist (only for a new record, since
+// reading an existing record already proves its columns exist).
+async function checkFields(cfg, table, values, creating) {
+  const warnings = [];
+  const warn = (field, check, message) => warnings.push({ field, check, message });
+  const skipped = (why) => ({ warnings: [{ field: null, check: 'skipped', message: `The field checks were skipped because ${why}. The plan was saved without them.` }], unknown: [] });
+  const fields = Object.keys(values);
+  try {
+    const chain = await tableChain(cfg, table);
+    if (!chain) return skipped(`the definition of ${table} in sys_db_object could not be read`);
+    const tables = chain.join(',');
+    const columns = nearestByElement(await listRows(cfg, 'sys_dictionary', `nameIN${tables}^elementIN${fields.join(',')}`,
+      'name,element,internal_type,reference,mandatory,read_only,choice,max_length,default_value'), chain);
+    if (!columns.size && !(await listRows(cfg, 'sys_dictionary', `nameIN${tables}`, 'name')).length) {
+      return skipped('the column definitions in sys_dictionary could not be read');
+    }
+    const overrides = nearestByElement(await listRows(cfg, 'sys_dictionary_override', `nameIN${tables}`,
+      'name,element,mandatory_override,mandatory,read_only_override,read_only,default_value_override,default_value'), chain);
+
+    const unknown = [];
+    for (const field of fields) {
+      const column = columns.get(field);
+      if (!column) {
+        if (creating) unknown.push(field);
+        continue;
+      }
+      const def = definitionOf(column, overrides.get(field));
+      const value = values[field];
+      if (def.readOnly) warn(field, 'read_only', `${field} is read only in the dictionary. Check that it is meant to be changed.`);
+      if (value === '') {
+        if (def.mandatory) warn(field, 'mandatory', `${field} is mandatory and the plan empties it.`);
+        continue;
+      }
+      if (def.type === 'integer' && !/^-?\d+$/.test(value)) {
+        warn(field, 'type', `${JSON.stringify(value)} is not a whole number, but ${field} is an integer column.`);
+      } else if (['decimal', 'float', 'currency', 'price'].includes(def.type) && !Number.isFinite(Number(value))) {
+        warn(field, 'type', `${JSON.stringify(value)} is not a number, but ${field} is a ${def.type} column.`);
+      } else if (def.type === 'boolean' && value !== 'true' && value !== 'false') {
+        warn(field, 'type', `${JSON.stringify(value)} is not true or false, but ${field} is a true or false column.`);
+      }
+      if (def.type === 'string' && def.maxLength && value.length > def.maxLength) {
+        warn(field, 'max_length', `The value is ${value.length} characters long, but ${field} holds at most ${def.maxLength}. ServiceNow would cut it off.`);
+      }
+      // 1 and 3 are drop down lists. 2 is a suggestion list, which takes any text.
+      if (def.choice === '1' || def.choice === '3') {
+        const choices = await choicesOf(cfg, chain, field);
+        if (choices && !choices.has(value)) {
+          const list = [...choices].map(([v, label]) => (label && label !== v ? `${v} (${label})` : v)).join(', ');
+          warn(field, 'choice', `${JSON.stringify(value)} is not a choice for ${table}.${field}. The choices are: ${list}.`);
+        }
+      }
+      if (def.type === 'reference' && TABLE_RE.test(def.reference)) {
+        if (!SYS_ID_RE.test(value)) {
+          warn(field, 'reference', `${JSON.stringify(value)} is not a sys_id. ServiceNow would try to match it to a ${def.reference} record by its display value, which may find the wrong record or none.`);
+        } else if ((await recordExists(cfg, def.reference, value.toLowerCase())) === false) {
+          warn(field, 'reference', `There is no ${def.reference} record with sys_id ${value}, or you are not allowed to read it.`);
+        }
+      }
+    }
+
+    if (creating) {
+      const required = nearestByElement(await listRows(cfg, 'sys_dictionary', `nameIN${tables}^mandatory=true^elementISNOTEMPTY`,
+        'name,element,mandatory,default_value'), chain);
+      for (const [element, override] of overrides) {
+        if (asText(override.mandatory_override) === 'true' && asText(override.mandatory) === 'true' && !required.has(element)) {
+          required.set(element, { name: override.name, element, mandatory: 'true', default_value: '' });
+        }
+      }
+      for (const [element, column] of required) {
+        if (element in values) continue;
+        const def = definitionOf(column, overrides.get(element));
+        if (def.mandatory && !def.defaultValue) warn(element, 'mandatory', `${element} is mandatory and the plan leaves it empty.`);
+      }
+    }
+    return { warnings, unknown };
+  } catch (err) {
+    if (!(err instanceof ToolError) || err.auth || err.network) throw err;
+    return skipped(`a dictionary read failed: ${err.message}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------
 
@@ -1348,7 +1517,7 @@ const TOOLS = [
   {
     name: 'sn_plan_change',
     write: false,
-    description: 'Propose a change to one record without writing it. Give sys_id to change an existing record, or leave it out to plan a new one. The server reads the current values, saves a plan with the before and after value of every field, and returns it with a plan_id. Only reads reach ServiceNow. Give reference fields as sys_ids and choice fields as stored values, the form sn_table_get returns, so the plan compares like with like. Show the changes to the user and call sn_apply_plan only after they agree.',
+    description: 'Propose a change to one record without writing it. Give sys_id to change an existing record, or leave it out to plan a new one. The server reads the current values, saves a plan with the before and after value of every field, and returns it with a plan_id. Only reads reach ServiceNow. It also checks each value against the dictionary (choice lists, references, whole numbers, true or false, length, read only, and for a new record unknown and mandatory columns) and returns what it finds as warnings, so a plan can be fixed before anyone reviews it. Give reference fields as sys_ids and choice fields as stored values, the form sn_table_get returns, so the plan compares like with like. Show the changes to the user and call sn_apply_plan only after they agree.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1397,6 +1566,10 @@ const TOOLS = [
         await snJson(cfg, 'GET', `/api/now/table/${table}`, { query: { sysparm_limit: 1, sysparm_fields: 'sys_id' } });
         for (const field of fields) changes.push({ field, before: null, after: record[field] });
       }
+      const checked = await checkFields(cfg, table, Object.fromEntries(changes.map((c) => [c.field, c.after])), !sysId);
+      if (checked.unknown.length) {
+        throw new ToolError(`These columns are not defined on ${table} or the tables it extends: ${checked.unknown.join(', ')}. Check the names with sn_table_schema. No plan was saved.`);
+      }
       const plan = {
         plan_id: newPlanId(),
         format: 1,
@@ -1409,17 +1582,18 @@ const TOOLS = [
         reason: reason || null,
         changes,
         no_change: noChange,
+        warnings: checked.warnings,
         base,
         applied: null,
         undone: null,
         last_error: null,
       };
       savePlan(cfg, plan);
-      return {
-        ...plan,
-        plan_file: planFilePath(cfg, plan.plan_id),
-        note: 'Nothing was sent to ServiceNow. Show these changes to the user, and call sn_apply_plan with this plan_id only after they agree.',
-      };
+      const problems = checked.warnings.filter((w) => w.check !== 'skipped').length;
+      const note = problems
+        ? `Nothing was sent to ServiceNow. The field checks found ${problems} ${problems === 1 ? 'problem' : 'problems'}, see warnings. Fix the plan and make it again, or show the warnings to the user together with the changes. Call sn_apply_plan only after they agree.`
+        : 'Nothing was sent to ServiceNow. Show these changes to the user, and call sn_apply_plan with this plan_id only after they agree.';
+      return { ...plan, plan_file: planFilePath(cfg, plan.plan_id), note };
     },
   },
   {

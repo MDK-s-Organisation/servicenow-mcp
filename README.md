@@ -121,7 +121,7 @@ Reviewed changes, see [Reviewed changes](#reviewed-changes-plan-apply-undo-check
 
 | Tool | What it does |
 | --- | --- |
-| `sn_plan_change` | Save a plan with the before and after of every field. Only reads ServiceNow, so it works with writes off |
+| `sn_plan_change` | Save a plan with the before and after of every field, and check each value against the dictionary. Only reads ServiceNow, so it works with writes off |
 | `sn_apply_plan` | Write a plan, after checking the record did not change since. Then read it back and report any difference |
 | `sn_undo_plan` | Put the old values back (or delete the record the plan created), unless someone changed them since |
 | `sn_check_plan` | Compare a plan with the record as it is now: can it still be applied, or has it drifted |
@@ -165,6 +165,23 @@ Say you ask: "put INC0010023 on hold and assign it to Bob".
 4. **Undo.** If the result is not what you wanted, `sn_undo_plan` puts the old values back. It refuses if someone changed those fields since, so it never overwrites later work. Fields outside the plan are left alone. For a plan that created a record, undo deletes that record.
 5. **Check.** `sn_check_plan` can run any time later. It lists each planned field that no longer holds what the plan left there, with the value now and who changed the record last.
 
+### Field checks while planning
+
+Many failed first tries can be seen before anyone reviews the plan. While planning, `sn_plan_change` reads the dictionary of the table and of the tables it extends (incident extends task), including dictionary overrides, and checks every planned value:
+
+| Check | Example warning |
+| --- | --- |
+| Choice list | `"4" is not a choice for incident.state. The choices are: 1 (New), 2 (In Progress), ...` |
+| Reference | `"Bob Caller" is not a sys_id`, or `There is no sys_user record with sys_id ...` |
+| Type | `"high" is not a whole number, but priority is an integer column`, and the same for true or false and decimal columns |
+| Length | `The value is 200 characters long, but short_description holds at most 160` |
+| Read only | `number is read only in the dictionary` |
+| Mandatory | a mandatory column the plan empties, or for a new record, one it leaves out and that has no default |
+
+Choices come from the nearest table that defines any, the same way ServiceNow picks them: incident has its own state choices, so the ones of task do not count for an incident. For a new record, a column that does not exist on the table or its parents stops the plan. Everything else is a warning saved with the plan, so the assistant can fix the plan before showing it to you, or show you the warnings next to the changes.
+
+The checks only read. If the dictionary cannot be read, for example because your user may not read `sys_dictionary`, the plan is still made and carries one warning saying the checks were skipped.
+
 When the first try does not work:
 
 - **ServiceNow refuses the write** (an ACL or a data policy). Nothing changed. The plan stays unapplied with the reason kept in it, and the assistant makes a new plan for you to review.
@@ -179,6 +196,7 @@ Limits:
 
 - The Table API has no "update only if unchanged" option. A change that lands in the moment between the final check and the write is not caught then, but the read back and `sn_check_plan` show it.
 - One record per plan, and only creates and updates. Deletes and attachments do not go through plans.
+- The field checks read the dictionary, not data policies, business rules or ACLs, so a write can still be refused or changed for those reasons. The read back after the write shows what was stored.
 - The approval is the assistant showing you the plan and your MCP client asking before it runs `sn_apply_plan`. The server has no approve button of its own.
 
 ## Settings

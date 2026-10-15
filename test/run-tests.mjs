@@ -562,10 +562,12 @@ await test('sn_plan_change: saves a before and after diff and writes nothing, ev
   assert.deepEqual(plan.base, { sys_mod_count: '0', sys_updated_on: row.sys_updated_on, sys_updated_by: 'system' });
   assert.equal(plan.reason, 'Waiting on the vendor');
   assert.match(plan.note, /Nothing was sent to ServiceNow/);
+  assert.deepEqual(plan.warnings, [], 'a valid choice and an existing reference pass the field checks');
   assert.deepEqual(writesSince(mark), [], 'planning only reads');
   assert.equal(S.counts.writes, writes);
-  assert.equal(lastRequest().query.sysparm_display_value, 'all');
-  assert.equal(lastRequest().query.sysparm_fields, 'state,priority,assigned_to,sys_mod_count,sys_updated_on,sys_updated_by');
+  const read = S.requests.slice(mark).find((r) => r.path === `/api/now/table/incident/${row.sys_id}`);
+  assert.equal(read.query.sysparm_display_value, 'all');
+  assert.equal(read.query.sysparm_fields, 'state,priority,assigned_to,sys_mod_count,sys_updated_on,sys_updated_by');
 
   assert.equal(plan.plan_file, path.join(PLANS, `${plan.plan_id}.json`));
   assert.equal(mode(plan.plan_file), 0o600);
@@ -719,24 +721,24 @@ await test('sn_apply_plan reports a field that a business rule changed', async (
 await test('a plan can create a record, and undo deletes it again', async () => {
   const count = S.tables.incident.length;
   const mark = S.requests.length;
-  const plan = await pm.ok('sn_plan_change', { table: 'incident', record: { short_description: 'Planned printer', priority: 4, u_nope: 'x' } });
+  const plan = await pm.ok('sn_plan_change', { table: 'incident', record: { short_description: 'Planned printer', priority: 4 } });
   assert.equal(plan.action, 'create');
   assert.equal(plan.sys_id, null);
   assert.equal(plan.base, null);
   assert.deepEqual(plan.changes, [
     { field: 'short_description', before: null, after: 'Planned printer' },
     { field: 'priority', before: null, after: '4' },
-    { field: 'u_nope', before: null, after: 'x' },
   ]);
+  assert.deepEqual(plan.warnings, []);
   assert.deepEqual(writesSince(mark), []);
   assert.equal((await main.ok('sn_check_plan', { plan_id: plan.plan_id })).can_apply, true);
 
   const out = await pm.ok('sn_apply_plan', { plan_id: plan.plan_id });
   const [post] = writesSince(mark);
   assert.equal(post.method, 'POST');
-  assert.deepEqual(post.body, { short_description: 'Planned printer', priority: '4', u_nope: 'x' });
+  assert.deepEqual(post.body, { short_description: 'Planned printer', priority: '4' });
   assert.match(out.sys_id, /^[0-9a-f]{32}$/);
-  assert.deepEqual(out.mismatches, [{ field: 'u_nope', sent: 'x', stored: null }], 'a column the table does not have is flagged');
+  assert.deepEqual(out.mismatches, []);
   assert.equal(S.tables.incident.length, count + 1);
   assert.equal(savedPlan(plan.plan_id).applied.sys_id, out.sys_id);
   assert.equal((await main.ok('sn_check_plan', { plan_id: plan.plan_id })).in_sync, true);
@@ -769,6 +771,55 @@ await test('a plan is refused while locked, for another instance, or when edited
   fs.writeFileSync(plan.plan_file, original);
   assert.equal(S.counts.writes, writes, 'nothing was written');
   assert.equal(row.state, '7');
+});
+
+await test('field checks: a plan with doubtful values is saved with a warning for each', async () => {
+  const row = S.tables.incident[0];
+  const mark = S.requests.length;
+  const plan = await main.ok('sn_plan_change', {
+    table: 'incident',
+    sys_id: row.sys_id,
+    record: { state: '4', assigned_to: ID, caller_id: 'Bob Caller', priority: 'high', short_description: 'x'.repeat(200), number: 'INC9', active: 'maybe' },
+  });
+  assert.deepEqual(plan.warnings, [
+    { field: 'state', check: 'choice', message: '"4" is not a choice for incident.state. The choices are: 1 (New), 2 (In Progress), 3 (On Hold), 6 (Resolved), 7 (Closed), 8 (Canceled).' },
+    { field: 'assigned_to', check: 'reference', message: `There is no sys_user record with sys_id ${ID}, or you are not allowed to read it.` },
+    { field: 'caller_id', check: 'reference', message: '"Bob Caller" is not a sys_id. ServiceNow would try to match it to a sys_user record by its display value, which may find the wrong record or none.' },
+    { field: 'priority', check: 'type', message: '"high" is not a whole number, but priority is an integer column.' },
+    { field: 'short_description', check: 'max_length', message: 'The value is 200 characters long, but short_description holds at most 160. ServiceNow would cut it off.' },
+    { field: 'number', check: 'read_only', message: 'number is read only in the dictionary. Check that it is meant to be changed.' },
+    { field: 'active', check: 'read_only', message: 'active is read only in the dictionary. Check that it is meant to be changed.' },
+    { field: 'active', check: 'type', message: '"maybe" is not true or false, but active is a true or false column.' },
+  ], 'task allows state 4 but incident has its own choices, and incident overrides active to read only');
+  assert.match(plan.note, /found 8 problems, see warnings/);
+  assert.deepEqual(savedPlan(plan.plan_id).warnings, plan.warnings);
+  assert.deepEqual(writesSince(mark), [], 'the checks only read');
+
+  const emptied = await main.ok('sn_plan_change', { table: 'incident', sys_id: row.sys_id, record: { short_description: '' } });
+  assert.deepEqual(emptied.warnings, [{ field: 'short_description', check: 'mandatory', message: 'short_description is mandatory and the plan empties it.' }]);
+});
+
+await test('field checks for a new record: an unknown column blocks the plan, a missing mandatory one warns', async () => {
+  const mark = S.requests.length;
+  await main.fails('sn_plan_change', { table: 'incident', record: { priority: '3', u_nope: 'x' } }, /not defined on incident or the tables it extends: u_nope\. .*No plan was saved/);
+  const plan = await main.ok('sn_plan_change', { table: 'incident', record: { priority: '3', state: '2' } });
+  assert.deepEqual(plan.warnings, [{ field: 'short_description', check: 'mandatory', message: 'short_description is mandatory and the plan leaves it empty.' }],
+    'state is found on task, the table incident extends');
+  assert.deepEqual(writesSince(mark), []);
+});
+
+await test('field checks are skipped with a warning when the dictionary cannot be read', async () => {
+  const row = S.tables.incident[0];
+  S.hidden.add('sys_dictionary');
+  try {
+    const plan = await main.ok('sn_plan_change', { table: 'incident', sys_id: row.sys_id, record: { priority: 'high' } });
+    assert.equal(plan.warnings.length, 1);
+    assert.equal(plan.warnings[0].check, 'skipped');
+    assert.match(plan.warnings[0].message, /skipped because a dictionary read failed: .*403.*The plan was saved without them\./);
+    assert.match(plan.note, /^Nothing was sent to ServiceNow\. Show these changes/, 'a skipped check is not counted as a problem');
+    const created = await main.ok('sn_plan_change', { table: 'incident', record: { u_nope: 'x' } });
+    assert.equal(created.warnings[0].check, 'skipped', 'without the dictionary an unknown column cannot be told apart, so it is not blocked');
+  } finally { S.hidden.clear(); }
 });
 
 await test('config file: found without env vars, allowWrite honoured, env wins', async () => {

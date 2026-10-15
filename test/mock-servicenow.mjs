@@ -10,7 +10,7 @@ const secret = () => crypto.randomBytes(24).toString('hex');
 const sha256url = (text) => crypto.createHash('sha256').update(text).digest('base64url');
 
 // Which columns point at another table, so display values can be shown.
-const REFERENCES = { incident: { caller_id: 'sys_user', assigned_to: 'sys_user' } };
+const REFERENCES = { incident: { caller_id: 'sys_user', assigned_to: 'sys_user' }, sys_db_object: { super_class: 'sys_db_object' } };
 
 // Columns every table has. ServiceNow sets these itself and ignores them in writes.
 const SYSTEM_COLUMNS = ['sys_id', 'sys_created_on', 'sys_created_by', 'sys_mod_count', 'sys_updated_on', 'sys_updated_by'];
@@ -27,9 +27,13 @@ function seedTables(user, other) {
     sys_id: hex32(), number, short_description: short, priority, state, active: state === '7' ? 'false' : 'true',
     caller_id: caller, assigned_to: user.sys_id, sys_created_on: `2026-09-0${priority} 10:00:00`,
   });
-  const col = (name, element, label, type, max, mandatory = 'false', reference = '') => ({
+  const col = (name, element, label, type, max, mandatory = 'false', reference = '', extra = {}) => ({
     sys_id: hex32(), name, element, column_label: label, internal_type: type, max_length: String(max), mandatory, reference,
+    read_only: 'false', choice: '0', default_value: '', ...extra,
   });
+  const taskTable = { sys_id: hex32(), name: 'task', super_class: '' };
+  const tableRow = (name, parent = '') => ({ sys_id: hex32(), name, super_class: parent });
+  const choice = (name, element, value, label, inactive = 'false') => ({ sys_id: hex32(), name, element, value, label, inactive, language: 'en' });
   return {
     incident: [
       inc('INC0000001', 'Printer on floor 2 is down', '1', '1', other.sys_id),
@@ -45,11 +49,34 @@ function seedTables(user, other) {
     ],
     sys_dictionary: [
       col('incident', '', 'Incident', 'collection', 40),
-      col('incident', 'number', 'Number', 'string', 40),
+      col('incident', 'number', 'Number', 'string', 40, 'false', '', { read_only: 'true' }),
       col('incident', 'short_description', 'Short description', 'string', 160, 'true'),
       col('incident', 'caller_id', 'Caller', 'reference', 32, 'false', 'sys_user'),
       col('incident', 'priority', 'Priority', 'integer', 40),
-      col('task', 'state', 'State', 'integer', 40),
+      col('task', '', 'Task', 'collection', 40),
+      col('task', 'state', 'State', 'integer', 40, 'false', '', { choice: '3', default_value: '1' }),
+      col('task', 'assigned_to', 'Assigned to', 'reference', 32, 'false', 'sys_user'),
+      col('task', 'active', 'Active', 'boolean', 40, 'false', '', { default_value: 'true' }),
+      col('sys_properties', '', 'System Property', 'collection', 40),
+      col('sys_properties', 'value', 'Value', 'string', 4000),
+    ],
+    // incident extends task, the way it does on a real instance
+    sys_db_object: [
+      taskTable,
+      tableRow('incident', taskTable.sys_id),
+      ...['sys_user', 'sys_properties', 'sys_dictionary', 'sys_db_object', 'sys_choice', 'sys_dictionary_override'].map((name) => tableRow(name)),
+    ],
+    // incident has its own state choices, which win over the ones of task
+    sys_choice: [
+      ...[['1', 'New'], ['2', 'In Progress'], ['3', 'On Hold'], ['6', 'Resolved'], ['7', 'Closed'], ['8', 'Canceled']].map(([v, l]) => choice('incident', 'state', v, l)),
+      choice('incident', 'state', '9', 'Retired', 'true'),
+      ...[['1', 'Open'], ['2', 'Work in Progress'], ['3', 'Closed Complete'], ['4', 'Closed Incomplete']].map(([v, l]) => choice('task', 'state', v, l)),
+    ],
+    sys_dictionary_override: [
+      {
+        sys_id: hex32(), name: 'incident', element: 'active', base_table: 'task', read_only_override: 'true', read_only: 'true',
+        mandatory_override: 'false', mandatory: 'false', default_value_override: 'false', default_value: '',
+      },
     ],
   };
 }
@@ -68,13 +95,14 @@ function runQuery(rows, query, userName) {
       out = out.filter((row) => (String(row[m[1]] ?? '') !== '') === want);
       continue;
     }
-    m = /^([a-z0-9_.]+)(!=|=|LIKE|STARTSWITH)(.*)$/.exec(term);
+    m = /^([a-z0-9_.]+)(!=|=|LIKE|STARTSWITH|IN)(.*)$/.exec(term);
     if (!m) throw new Error(`Unsupported query term: ${term}`);
     const value = m[3] === 'javascript:gs.getUserName()' ? userName : m[3];
     out = out.filter((row) => {
       const have = String(row[m[1]] ?? '');
       if (m[2] === '=') return have === value;
       if (m[2] === '!=') return have !== value;
+      if (m[2] === 'IN') return value.split(',').includes(have);
       if (m[2] === 'LIKE') return have.toLowerCase().includes(value.toLowerCase());
       return have.startsWith(value);
     });
@@ -107,6 +135,7 @@ export async function startMock(options = {}) {
     tables: seedTables(user, other),
     columns: {}, // table -> Set of column names. Unknown columns are left out of reads and dropped from writes.
     rules: [], // business rules: (table, row) => void, run on every create and update before the row is stored
+    hidden: new Set(), // tables the signed in user may not read: every request answers 403
     attachments: new Map(), // sys_id -> { meta, bytes }
     revokeAccessTokens() { this.accessTokens.clear(); },
     // Change a record the way another user would, outside the API.
@@ -232,6 +261,14 @@ export async function startMock(options = {}) {
     const fields = (q.get('sysparm_fields') || '').split(',').filter(Boolean);
     const out = {};
     for (const key of fields.length ? fields : Object.keys(row)) {
+      // A dot walked column such as super_class.name reads through one reference.
+      const [head, tail] = key.split('.');
+      if (tail !== undefined) {
+        const refTable = (REFERENCES[table] || {})[head];
+        const target = refTable ? state.tables[refTable].find((r) => r.sys_id === row[head]) : null;
+        out[key] = target ? String(target[tail] ?? '') : '';
+        continue;
+      }
       // Like ServiceNow, a column the table does not have is left out.
       if (state.columns[table] && !state.columns[table].has(key)) continue;
       const value = row[key] ?? '';
@@ -250,6 +287,7 @@ export async function startMock(options = {}) {
     const rows = state.tables[table];
     const q = url.searchParams;
     if (!rows) return snError(res, 400, `Invalid table ${table}`);
+    if (state.hidden.has(table)) return snError(res, 403, 'User Not Authorized', 'ACL restricts access to this table');
     const write = req.method !== 'GET';
     if (write) state.counts.writes += 1;
     if (write && table === 'sys_properties') {
