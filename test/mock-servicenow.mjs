@@ -12,6 +12,16 @@ const sha256url = (text) => crypto.createHash('sha256').update(text).digest('bas
 // Which columns point at another table, so display values can be shown.
 const REFERENCES = { incident: { caller_id: 'sys_user', assigned_to: 'sys_user' } };
 
+// Columns every table has. ServiceNow sets these itself and ignores them in writes.
+const SYSTEM_COLUMNS = ['sys_id', 'sys_created_on', 'sys_created_by', 'sys_mod_count', 'sys_updated_on', 'sys_updated_by'];
+
+// A clock that moves one second per write, so sys_updated_on always changes.
+let clock = Date.UTC(2026, 8, 1, 8, 0, 0);
+const tick = () => {
+  clock += 1000;
+  return new Date(clock).toISOString().replace('T', ' ').slice(0, 19);
+};
+
 function seedTables(user, other) {
   const inc = (number, short, priority, state, caller) => ({
     sys_id: hex32(), number, short_description: short, priority, state, active: state === '7' ? 'false' : 'true',
@@ -95,8 +105,16 @@ export async function startMock(options = {}) {
     refreshTokens: new Set(),
     user,
     tables: seedTables(user, other),
+    columns: {}, // table -> Set of column names. Unknown columns are left out of reads and dropped from writes.
+    rules: [], // business rules: (table, row) => void, run on every create and update before the row is stored
     attachments: new Map(), // sys_id -> { meta, bytes }
     revokeAccessTokens() { this.accessTokens.clear(); },
+    // Change a record the way another user would, outside the API.
+    touch(table, sysId, changes, by = other.user_name) {
+      const row = this.tables[table].find((r) => r.sys_id === sysId);
+      Object.assign(row, changes, { sys_mod_count: String(Number(row.sys_mod_count) + 1), sys_updated_on: tick(), sys_updated_by: by });
+      return row;
+    },
     allSecrets() { return [...this.issued.codes, ...this.issued.accessTokens, ...this.issued.refreshTokens, ...this.issued.verifiers]; },
     addAttachment(table, sysId, fileName, contentType, bytes) {
       const meta = {
@@ -108,6 +126,22 @@ export async function startMock(options = {}) {
     },
   };
   state.addAttachment('incident', state.tables.incident[0].sys_id, 'printer-log.txt', 'text/plain', Buffer.from('paper jam at 09:14\nrestart at 09:20\n'));
+  for (const [table, rows] of Object.entries(state.tables)) {
+    for (const row of rows) Object.assign(row, { sys_mod_count: '0', sys_updated_on: tick(), sys_updated_by: 'system' });
+    state.columns[table] = new Set([...SYSTEM_COLUMNS, ...rows.flatMap((row) => Object.keys(row))]);
+  }
+
+  // Copy the columns a write may set, run the business rules, and stamp the row.
+  function saveRow(table, row, body) {
+    for (const [key, value] of Object.entries(body)) {
+      if (state.columns[table].has(key) && !SYSTEM_COLUMNS.includes(key)) row[key] = value;
+    }
+    for (const rule of state.rules) rule(table, row);
+    const now = tick();
+    if (row.sys_mod_count === undefined) Object.assign(row, { sys_mod_count: '-1', sys_created_on: now, sys_created_by: user.user_name });
+    Object.assign(row, { sys_mod_count: String(Number(row.sys_mod_count) + 1), sys_updated_on: now, sys_updated_by: user.user_name });
+    return row;
+  }
 
   const json = (res, status, body, headers = {}) => {
     res.writeHead(status, { 'Content-Type': 'application/json', ...headers });
@@ -198,6 +232,8 @@ export async function startMock(options = {}) {
     const fields = (q.get('sysparm_fields') || '').split(',').filter(Boolean);
     const out = {};
     for (const key of fields.length ? fields : Object.keys(row)) {
+      // Like ServiceNow, a column the table does not have is left out.
+      if (state.columns[table] && !state.columns[table].has(key)) continue;
       const value = row[key] ?? '';
       const refTable = (REFERENCES[table] || {})[key];
       const target = refTable ? state.tables[refTable].find((r) => r.sys_id === value) : null;
@@ -210,7 +246,7 @@ export async function startMock(options = {}) {
     return out;
   }
 
-  async function tableApi(req, res, url, table, sysId) {
+  async function tableApi(req, res, url, table, sysId, raw) {
     const rows = state.tables[table];
     const q = url.searchParams;
     if (!rows) return snError(res, 400, `Invalid table ${table}`);
@@ -228,7 +264,7 @@ export async function startMock(options = {}) {
       return json(res, 200, { result: page }, { 'X-Total-Count': String(found.length) });
     }
     if (!sysId && req.method === 'POST') {
-      const row = { sys_id: hex32(), ...JSON.parse((await readBody(req)).toString('utf8') || '{}') };
+      const row = saveRow(table, { sys_id: hex32() }, JSON.parse(raw.toString('utf8') || '{}'));
       rows.push(row);
       return json(res, 201, { result: shape(table, row, q) });
     }
@@ -236,7 +272,7 @@ export async function startMock(options = {}) {
     if (index === -1) return snError(res, 404, 'No Record found', 'Record doesn\'t exist or ACL restricts the record retrieval');
     if (req.method === 'GET') return json(res, 200, { result: shape(table, rows[index], q) });
     if (req.method === 'PATCH' || req.method === 'PUT') {
-      Object.assign(rows[index], JSON.parse((await readBody(req)).toString('utf8') || '{}'), { sys_id: sysId });
+      saveRow(table, rows[index], JSON.parse(raw.toString('utf8') || '{}'));
       return json(res, 200, { result: shape(table, rows[index], q) });
     }
     if (req.method === 'DELETE') {
@@ -247,7 +283,7 @@ export async function startMock(options = {}) {
     return snError(res, 405, 'Method not allowed');
   }
 
-  async function attachmentApi(req, res, url, rest) {
+  async function attachmentApi(req, res, url, rest, raw) {
     const q = url.searchParams;
     if (req.method !== 'GET') state.counts.writes += 1;
     if (rest === '' && req.method === 'GET') {
@@ -258,7 +294,7 @@ export async function startMock(options = {}) {
     if (rest === '/file' && req.method === 'POST') {
       const [table, sysId, fileName] = [q.get('table_name'), q.get('table_sys_id'), q.get('file_name')];
       if (!table || !sysId || !fileName) return snError(res, 400, 'Missing parameters', 'table_name, table_sys_id and file_name are required');
-      const meta = state.addAttachment(table, sysId, fileName, req.headers['content-type'] || '', await readBody(req));
+      const meta = state.addAttachment(table, sysId, fileName, req.headers['content-type'] || '', raw);
       return json(res, 201, { result: meta });
     }
     const m = /^\/([0-9a-f]{32})(\/file)?$/.exec(rest);
@@ -281,9 +317,15 @@ export async function startMock(options = {}) {
     state.counts.api += 1;
     const auth = req.headers.authorization || '';
     const bearer = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+    const raw = await readBody(req);
+    const contentType = req.headers['content-type'] || '';
+    let body; // JSON bodies are kept so the tests can see exactly what was sent
+    if (contentType.startsWith('application/json') && raw.length) {
+      try { body = JSON.parse(raw.toString('utf8')); } catch { body = undefined; }
+    }
     state.requests.push({
       method: req.method, path: url.pathname, query: Object.fromEntries(url.searchParams),
-      accept: req.headers.accept || '', bearer: Boolean(bearer), contentType: req.headers['content-type'] || '',
+      accept: req.headers.accept || '', bearer: Boolean(bearer), contentType, body,
     });
     const expiry = state.accessTokens.get(bearer);
     if (!expiry || expiry <= Date.now()) {
@@ -298,9 +340,9 @@ export async function startMock(options = {}) {
       return json(res, 200, { result: { user_sys_id: user.sys_id, user_name: user.user_name, user_display_name: user.name, user_initials: 'AA' } });
     }
     let m = /^\/api\/now\/table\/([^/]+)(?:\/([^/]+))?$/.exec(url.pathname);
-    if (m) return tableApi(req, res, url, m[1], m[2]);
+    if (m) return tableApi(req, res, url, m[1], m[2], raw);
     m = /^\/api\/now\/attachment(.*)$/.exec(url.pathname);
-    if (m) return attachmentApi(req, res, url, m[1]);
+    if (m) return attachmentApi(req, res, url, m[1], raw);
     return snError(res, 404, 'Requested URI does not represent any resource');
   }
 

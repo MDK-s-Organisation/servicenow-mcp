@@ -5,6 +5,7 @@ An MCP server that connects Claude (or any MCP client) to your own ServiceNow in
 - Works with any instance: a personal developer instance or a company one.
 - You sign in as yourself in the browser (OAuth with PKCE). No password is ever typed into or stored by this tool, and it can only see what your ServiceNow user can see.
 - Read-only unless you turn writes on.
+- Changes can go through a plan: you see the exact before and after of every field before anything is written, and you can undo it or check it for drift later.
 - One file, Node 18 or newer, no npm packages.
 
 ## Quick start
@@ -87,7 +88,7 @@ claude mcp add servicenow -- node /absolute/path/to/servicenow-mcp/server.mjs
 ```
 node server.mjs            # run as an MCP server over stdio (what the MCP client starts)
 node server.mjs login      # sign in
-node server.mjs status     # instance, signed in or not, token expiry, writes on or off
+node server.mjs status     # instance, signed in or not, token expiry, write mode, plans folder
 node server.mjs logout     # delete the saved tokens
 ```
 
@@ -116,17 +117,69 @@ Write tools, listed but refused unless writes are on:
 | `sn_attachment_upload` | Attach a local file to a record |
 | `sn_attachment_delete` | Delete an attachment |
 
+Reviewed changes, see [Reviewed changes](#reviewed-changes-plan-apply-undo-check):
+
+| Tool | What it does |
+| --- | --- |
+| `sn_plan_change` | Save a plan with the before and after of every field. Only reads ServiceNow, so it works with writes off |
+| `sn_apply_plan` | Write a plan, after checking the record did not change since. Then read it back and report any difference |
+| `sn_undo_plan` | Put the old values back (or delete the record the plan created), unless someone changed them since |
+| `sn_check_plan` | Compare a plan with the record as it is now: can it still be applied, or has it drifted |
+
 ## Read-only by default
 
-Write tools only run when `SN_ALLOW_WRITE=1` is set where the server is registered:
+There are three settings for `SN_ALLOW_WRITE`:
+
+| Value | What can write |
+| --- | --- |
+| not set | Nothing. Plans can still be made and checked, but not applied |
+| `plan` | Only `sn_apply_plan` and `sn_undo_plan`. The direct create, update, delete and upload tools refuse, so every change is a plan someone looked at first |
+| `1` | Every write tool. Plans are there when you want them |
+
+Set it where the server is registered:
 
 ```
-claude mcp add servicenow -e SN_ALLOW_WRITE=1 -- npx -y github:MDK-s-Organisation/servicenow-mcp
+claude mcp add servicenow -e SN_ALLOW_WRITE=plan -- npx -y github:MDK-s-Organisation/servicenow-mcp
 ```
 
-In a JSON config, add `"env": { "SN_ALLOW_WRITE": "1" }` next to `command` and `args`.
+In a JSON config, add `"env": { "SN_ALLOW_WRITE": "plan" }` next to `command` and `args`.
 
-Without it the write tools return a clear refusal and send nothing to ServiceNow. Even with writes on, the server can only do what your ServiceNow user is allowed to do.
+A refused tool returns a clear message and sends nothing to ServiceNow. Even with writes on, the server can only do what your ServiceNow user is allowed to do.
+
+## Reviewed changes: plan, apply, undo, check
+
+Say you ask: "put INC0010023 on hold and assign it to Bob".
+
+1. **Plan.** The assistant calls `sn_plan_change`. The server reads the record and saves a plan like this one. Nothing is written.
+
+   ```
+   plan 20261016-101500-1a2b3c4d   incident <sys_id>
+     state        "2"                 ->  "3"
+     assigned_to  "<sys_id>" (Ada)    ->  "<Bob's sys_id>"
+     priority     already "2", left out
+   ```
+
+   The plan also keeps the record's `sys_mod_count`, the counter ServiceNow raises on every save.
+2. **Review.** The assistant shows you the plan and asks. If you say no, nothing ever reaches the instance.
+3. **Apply.** `sn_apply_plan` reads the record again. If the counter moved, someone changed the record after you reviewed it, so it stops and writes nothing. Otherwise it sends exactly the planned fields, reads the record back, and tells you about any field ServiceNow stored differently, for example because a business rule changed it.
+4. **Undo.** If the result is not what you wanted, `sn_undo_plan` puts the old values back. It refuses if someone changed those fields since, so it never overwrites later work. Fields outside the plan are left alone. For a plan that created a record, undo deletes that record.
+5. **Check.** `sn_check_plan` can run any time later. It lists each planned field that no longer holds what the plan left there, with the value now and who changed the record last.
+
+When the first try does not work:
+
+- **ServiceNow refuses the write** (an ACL or a data policy). Nothing changed. The plan stays unapplied with the reason kept in it, and the assistant makes a new plan for you to review.
+- **The write lands but is wrong.** Undo it in one call, then plan again.
+- **It takes several tries.** Each try is a different change, so it needs a fresh look. To keep the rounds down, try things on a sub-production instance first and bring only the final plan to the instance that matters.
+
+Give reference fields as sys_ids and choice fields as their stored values, the form `sn_table_get` returns by default, so the plan compares like with like.
+
+Plans are JSON files in the `plans` folder next to the config file (`~/.config/servicenow-mcp/plans` by default). The folder is mode 0700 and each file 0600. A plan only works on the instance it was made for, and the server checks a plan file again before using it, in case it was edited by hand.
+
+Limits:
+
+- The Table API has no "update only if unchanged" option. A change that lands in the moment between the final check and the write is not caught then, but the read back and `sn_check_plan` show it.
+- One record per plan, and only creates and updates. Deletes and attachments do not go through plans.
+- The approval is the assistant showing you the plan and your MCP client asking before it runs `sn_apply_plan`. The server has no approve button of its own.
 
 ## Settings
 
@@ -140,13 +193,14 @@ Environment variables, all optional once you have signed in:
 | `SN_REDIRECT_PORT` | `8787` |
 | `SN_TOKEN_FILE` | `~/.config/servicenow-mcp/tokens.json` |
 | `SN_CONFIG_FILE` | `~/.config/servicenow-mcp/config.json` |
-| `SN_ALLOW_WRITE` | unset, writes are off unless this is exactly `1` |
+| `SN_ALLOW_WRITE` | unset, writes are off unless this is exactly `1` (every write tool) or `plan` (only through plans) |
+| `SN_PLAN_DIR` | `plans` in the folder of the config file |
 
-The config file may hold `instance`, `clientId`, `redirectPort` and `allowWrite`. Environment variables win over the file.
+The config file may hold `instance`, `clientId`, `redirectPort` and `allowWrite` (`true` or `"plan"`). Environment variables win over the file.
 
 If your admin registered a confidential client (one with a secret), set `SN_CLIENT_SECRET` both when you run `login` and where the server is registered. The secret is read from the environment only and is never written to disk by this tool.
 
-To use two instances, give each its own files with `SN_TOKEN_FILE` and `SN_CONFIG_FILE`, and register the server twice under different names.
+To use two instances, give each its own files with `SN_TOKEN_FILE` and `SN_CONFIG_FILE`, and register the server twice under different names. Each one keeps its plans next to its own config file.
 
 ## Where tokens are kept
 

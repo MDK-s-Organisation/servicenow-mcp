@@ -189,9 +189,13 @@ async function test(name, fn) {
 const A = path.join(ROOT, 'a', 'store'); // the main sign in used by most tests
 const dirA = envFor(A);
 const TOOL_NAMES = ['sn_instance_info', 'sn_table_query', 'sn_table_get', 'sn_table_schema', 'sn_attachment_list', 'sn_attachment_download',
-  'sn_table_create', 'sn_table_update', 'sn_table_delete', 'sn_attachment_upload', 'sn_attachment_delete'];
-const WRITE_TOOLS = TOOL_NAMES.slice(6);
+  'sn_table_create', 'sn_table_update', 'sn_table_delete', 'sn_attachment_upload', 'sn_attachment_delete',
+  'sn_plan_change', 'sn_apply_plan', 'sn_undo_plan', 'sn_check_plan'];
+const DIRECT_WRITE_TOOLS = TOOL_NAMES.slice(6, 11);
+const WRITE_TOOLS = [...DIRECT_WRITE_TOOLS, 'sn_apply_plan', 'sn_undo_plan'];
+const PLAN_ID_TOOLS = ['sn_apply_plan', 'sn_undo_plan', 'sn_check_plan'];
 const ID = 'a'.repeat(32);
+const NO_PLAN = '20261016-101500-0123abcd';
 const uploadSource = path.join(ROOT, 'notes.docx');
 fs.writeFileSync(uploadSource, crypto.randomBytes(2048));
 // Arguments that pass validation for every tool.
@@ -204,8 +208,14 @@ const VALID = {
   sn_table_delete: { table: 'incident', sys_id: ID },
   sn_attachment_upload: { table: 'incident', sys_id: ID, file_path: uploadSource },
   sn_attachment_delete: { sys_id: ID },
+  sn_plan_change: { table: 'incident', sys_id: ID, record: { state: '2' } },
+  sn_apply_plan: { plan_id: NO_PLAN }, sn_undo_plan: { plan_id: NO_PLAN }, sn_check_plan: { plan_id: NO_PLAN },
 };
 let main; // shared read-only MCP client for dir A
+let pm; // MCP client for dir A with SN_ALLOW_WRITE=plan
+const PLANS = path.join(A, 'plans'); // plans sit next to the config file
+const savedPlan = (id) => JSON.parse(fs.readFileSync(path.join(PLANS, `${id}.json`), 'utf8'));
+const writesSince = (mark) => S.requests.slice(mark).filter((r) => r.method !== 'GET');
 
 await test('node --check server.mjs', async () => {
   const proc = spawn(process.execPath, ['--check', SERVER], { stdio: 'ignore' });
@@ -296,7 +306,9 @@ await test('login: full PKCE flow against the mock with --no-open', async () => 
 
 await test('login: runs the open command with the URL unless --no-open (fake open, no browser)', async () => {
   const { url, cli } = await login(path.join(ROOT, 'b'), []);
-  for (let i = 0; i < 120 && !fs.existsSync(OPEN_MARK); i += 1) await sleep(25);
+  // The fake open creates the file before it writes the URL, so wait for the URL.
+  const opened = () => fs.existsSync(OPEN_MARK) && fs.readFileSync(OPEN_MARK, 'utf8') !== '';
+  for (let i = 0; i < 120 && !opened(); i += 1) await sleep(25);
   assert.equal(fs.readFileSync(OPEN_MARK, 'utf8'), url);
   await browse(url);
   assert.equal((await cli.done).code, 0);
@@ -375,7 +387,7 @@ await test('tools/list: every tool is there with a valid schema', async () => {
 });
 
 await test('sn_instance_info, with the fallback user lookup', async () => {
-  const expected = { instance: mock.url, user: { name: 'Ada Admin', user_name: 'ada.admin', sys_id: S.user.sys_id }, build: 'glide-mock-01-01-2026__patch0', writes_allowed: false };
+  const expected = { instance: mock.url, user: { name: 'Ada Admin', user_name: 'ada.admin', sys_id: S.user.sys_id }, build: 'glide-mock-01-01-2026__patch0', writes_allowed: false, write_mode: 'off' };
   assert.deepEqual(await main.ok('sn_instance_info', {}), expected);
   S.disableCurrentUser = true;
   try {
@@ -475,6 +487,13 @@ await test('input validation returns tool errors and sends nothing', async () =>
     ['sn_attachment_list', { sys_id: '123' }, /32 hex characters/],
     ['sn_attachment_download', { sys_id: ID, save_to: 'relative/file.txt' }, /absolute local path/],
     ['sn_attachment_download', { sys_id: ID, save_to: path.join(ROOT, 'no-such-folder', 'f.txt') }, /does not exist/],
+    ['sn_plan_change', { table: 'incident', record: {} }, /at least one field/],
+    ['sn_plan_change', { table: 'incident', record: { 'caller_id.name': 'x' } }, /not a column name/],
+    ['sn_plan_change', { table: 'incident', sys_id: ID, record: { sys_mod_count: '9' } }, /kept by ServiceNow itself/],
+    ['sn_plan_change', { table: 'incident', record: { state: { value: '2' } } }, /must be text, a number, true or false, or null/],
+    ['sn_plan_change', { table: 'incident', record: { state: '2' }, reason: 7 }, /reason must be a string/],
+    ['sn_check_plan', { plan_id: '../tokens' }, /plan_id must be a plan id/],
+    ['sn_check_plan', { plan_id: NO_PLAN }, /There is no plan/],
   ];
   for (const [name, args, pattern] of cases) await main.fails(name, args, pattern);
   const notObject = await main.request('tools/call', { name: 'sn_table_query', arguments: 'incident' });
@@ -482,7 +501,7 @@ await test('input validation returns tool errors and sends nothing', async () =>
   assert.equal(S.counts.total, before);
 });
 
-await test('write tools are refused unless SN_ALLOW_WRITE is exactly 1', async () => {
+await test('write tools are refused unless SN_ALLOW_WRITE is exactly 1 (or plan)', async () => {
   const before = S.counts.total;
   const almost = new Mcp(envFor(A, { SN_ALLOW_WRITE: 'true' }), 'serve allow=true');
   for (const name of WRITE_TOOLS) {
@@ -525,6 +544,233 @@ await test('write tools work with SN_ALLOW_WRITE=1, and a 403 is passed on', asy
   await rw.close();
 });
 
+let firstPlan; // planned, applied, checked for drift and undone by the tests below
+await test('sn_plan_change: saves a before and after diff and writes nothing, even with writes off', async () => {
+  const row = S.tables.incident[1];
+  const bob = S.tables.sys_user[1].sys_id;
+  const mark = S.requests.length;
+  const writes = S.counts.writes;
+  const plan = await main.ok('sn_plan_change', { table: 'incident', sys_id: row.sys_id, record: { state: 3, priority: '2', assigned_to: bob }, reason: 'Waiting on the vendor' });
+  assert.match(plan.plan_id, /^\d{8}-\d{6}-[0-9a-f]{8}$/);
+  assert.equal(plan.status, 'planned');
+  assert.equal(plan.action, 'update');
+  assert.deepEqual(plan.changes, [
+    { field: 'state', before: '2', after: '3' },
+    { field: 'assigned_to', before: S.user.sys_id, after: bob, before_display: 'Ada Admin' },
+  ]);
+  assert.deepEqual(plan.no_change, ['priority']);
+  assert.deepEqual(plan.base, { sys_mod_count: '0', sys_updated_on: row.sys_updated_on, sys_updated_by: 'system' });
+  assert.equal(plan.reason, 'Waiting on the vendor');
+  assert.match(plan.note, /Nothing was sent to ServiceNow/);
+  assert.deepEqual(writesSince(mark), [], 'planning only reads');
+  assert.equal(S.counts.writes, writes);
+  assert.equal(lastRequest().query.sysparm_display_value, 'all');
+  assert.equal(lastRequest().query.sysparm_fields, 'state,priority,assigned_to,sys_mod_count,sys_updated_on,sys_updated_by');
+
+  assert.equal(plan.plan_file, path.join(PLANS, `${plan.plan_id}.json`));
+  assert.equal(mode(plan.plan_file), 0o600);
+  assert.equal(mode(PLANS), 0o700);
+  const saved = savedPlan(plan.plan_id);
+  assert.deepEqual(saved.changes, plan.changes);
+  assert.equal(saved.instance, mock.url);
+  assert.equal(saved.plan_file, undefined, 'the file holds the plan, not the extras of the reply');
+
+  await main.fails('sn_plan_change', { table: 'incident', sys_id: row.sys_id, record: { state: '2' } }, /already has the planned value.*No plan was saved/);
+  await main.fails('sn_plan_change', { table: 'incident', sys_id: row.sys_id, record: { u_nope: 'x' } }, /did not return u_nope.*No plan was saved/);
+  await main.fails('sn_plan_change', { table: 'no_such_table', record: { name: 'x' } }, /status 400/);
+  assert.deepEqual(fs.readdirSync(PLANS), [`${plan.plan_id}.json`], 'a refused plan leaves no file');
+  firstPlan = plan.plan_id;
+});
+
+await test('SN_ALLOW_WRITE=plan: only the plan tools write, the direct ones refuse', async () => {
+  pm = new Mcp(envFor(A, { SN_ALLOW_WRITE: 'plan' }), 'serve plan mode');
+  const before = S.counts.total;
+  for (const name of DIRECT_WRITE_TOOLS) await pm.fails(name, VALID[name], /only writes through reviewed plans \(SN_ALLOW_WRITE=plan\)/);
+  assert.equal(S.counts.total, before, 'nothing may reach ServiceNow');
+  const info = await pm.ok('sn_instance_info', {});
+  assert.equal(info.write_mode, 'plan');
+  assert.equal(info.writes_allowed, true);
+  const status = await runCli(['status'], envFor(A, { SN_ALLOW_WRITE: 'plan' }));
+  assert.match(status.stdout, /Writes allowed:\s+only through sn_apply_plan \(SN_ALLOW_WRITE=plan\)/);
+  assert.ok(status.stdout.includes(`Plans folder:    ${PLANS}\n`), status.stdout);
+});
+
+await test('sn_apply_plan: writes exactly the planned fields, reads them back, and only once', async () => {
+  const row = S.tables.incident[1];
+  const bob = S.tables.sys_user[1].sys_id;
+  const mark = S.requests.length;
+  const out = await pm.ok('sn_apply_plan', { plan_id: firstPlan });
+  const writes = writesSince(mark);
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].method, 'PATCH');
+  assert.equal(writes[0].path, `/api/now/table/incident/${row.sys_id}`);
+  assert.deepEqual(writes[0].body, { state: '3', assigned_to: bob }, 'only the changed fields, as planned');
+  assert.equal(out.status, 'applied');
+  assert.equal(out.matches_plan, true);
+  assert.deepEqual(out.stored, { state: '3', assigned_to: bob });
+  assert.deepEqual(out.mismatches, []);
+  assert.match(out.note, /sn_undo_plan/);
+  assert.equal(row.state, '3');
+  const saved = savedPlan(firstPlan);
+  assert.equal(saved.status, 'applied');
+  assert.equal(saved.applied.sys_mod_count, '1');
+  assert.equal(saved.applied.sys_updated_by, 'ada.admin');
+  assert.deepEqual(fs.readdirSync(PLANS).filter((name) => !name.endsWith('.json')), [], 'no lock or temp file is left');
+
+  await pm.fails('sn_apply_plan', { plan_id: firstPlan }, /already applied/);
+  assert.equal(writesSince(mark).length, 1, 'a plan is written once');
+  const check = await main.ok('sn_check_plan', { plan_id: firstPlan });
+  assert.deepEqual(check, {
+    plan_id: firstPlan, status: 'applied', action: 'update', table: 'incident', sys_id: row.sys_id,
+    record_exists: true, in_sync: true, drift: [], changed_since_apply: false,
+    last_updated_by: 'ada.admin', last_updated_on: row.sys_updated_on,
+    note: 'Every planned field still holds the value the plan left there.',
+  });
+});
+
+await test('sn_check_plan reports drift, and sn_undo_plan will not overwrite it', async () => {
+  const row = S.tables.incident[1];
+  S.touch('incident', row.sys_id, { short_description: 'Only the title changed' });
+  let check = await main.ok('sn_check_plan', { plan_id: firstPlan });
+  assert.equal(check.in_sync, true);
+  assert.equal(check.changed_since_apply, true);
+  assert.deepEqual(check.drift, []);
+  assert.match(check.note, /not in the planned fields/);
+
+  S.touch('incident', row.sys_id, { state: '1' });
+  check = await main.ok('sn_check_plan', { plan_id: firstPlan });
+  assert.equal(check.in_sync, false);
+  assert.deepEqual(check.drift, [{ field: 'state', expected: '3', now: '1' }]);
+  assert.equal(check.last_updated_by, 'bob.caller');
+
+  const writes = S.counts.writes;
+  await pm.fails('sn_undo_plan', { plan_id: firstPlan }, /Not undone.*bob\.caller.*state \(expected "3", now "1"\)/);
+  assert.equal(S.counts.writes, writes, 'nothing was written');
+  assert.equal(savedPlan(firstPlan).status, 'applied');
+});
+
+await test('sn_undo_plan puts the old values back and leaves other fields alone', async () => {
+  const row = S.tables.incident[1];
+  S.touch('incident', row.sys_id, { state: '3' }); // Bob puts the planned value back
+  const mark = S.requests.length;
+  const out = await pm.ok('sn_undo_plan', { plan_id: firstPlan });
+  const writes = writesSince(mark);
+  assert.equal(writes.length, 1);
+  assert.deepEqual(writes[0].body, { state: '2', assigned_to: S.user.sys_id });
+  assert.equal(out.status, 'undone');
+  assert.equal(out.matches_before, true);
+  assert.equal(row.state, '2');
+  assert.equal(row.assigned_to, S.user.sys_id);
+  assert.equal(row.short_description, 'Only the title changed', 'a field outside the plan is not touched');
+  assert.equal(savedPlan(firstPlan).status, 'undone');
+  const check = await main.ok('sn_check_plan', { plan_id: firstPlan });
+  assert.equal(check.in_sync, true);
+  assert.equal(check.changed_since_undo, false);
+  await pm.fails('sn_undo_plan', { plan_id: firstPlan }, /already undone/);
+  await pm.fails('sn_apply_plan', { plan_id: firstPlan }, /applied and then undone/);
+});
+
+await test('sn_apply_plan refuses a plan when the record changed after it was made', async () => {
+  const row = S.tables.incident[2];
+  const plan = await pm.ok('sn_plan_change', { table: 'incident', sys_id: row.sys_id, record: { state: '2' } });
+  S.touch('incident', row.sys_id, { state: '6' });
+  const check = await main.ok('sn_check_plan', { plan_id: plan.plan_id });
+  assert.equal(check.can_apply, false);
+  assert.equal(check.changed_since_plan, true);
+  assert.deepEqual(check.differences, [{ field: 'state', planned_from: '1', now: '6' }]);
+  const writes = S.counts.writes;
+  await pm.fails('sn_apply_plan', { plan_id: plan.plan_id }, /changed by bob\.caller at .* after this plan was made, so nothing was written\. Planned fields that changed: state \(was "1", now "6"\)/);
+  assert.equal(S.counts.writes, writes);
+  assert.equal(row.state, '6');
+  const saved = savedPlan(plan.plan_id);
+  assert.equal(saved.status, 'planned');
+  assert.equal(saved.last_error.during, 'apply');
+  assert.match(saved.last_error.error, /after this plan was made/);
+});
+
+await test('when ServiceNow refuses the write, the plan stays unapplied with the reason kept', async () => {
+  const prop = S.tables.sys_properties[1];
+  const plan = await pm.ok('sn_plan_change', { table: 'sys_properties', sys_id: prop.sys_id, record: { value: 'Changed' } });
+  const out = await pm.fails('sn_apply_plan', { plan_id: plan.plan_id }, /status 403.*Operation Failed/);
+  assert.equal(out.data.status, 403);
+  assert.match(out.data.detail, /ACL Exception/);
+  assert.equal(prop.value, 'Mock');
+  const saved = savedPlan(plan.plan_id);
+  assert.equal(saved.status, 'planned');
+  assert.match(saved.last_error.error, /403/);
+  assert.equal((await main.ok('sn_check_plan', { plan_id: plan.plan_id })).can_apply, true, 'nothing changed, so it can be tried again');
+});
+
+await test('sn_apply_plan reports a field that a business rule changed', async () => {
+  const row = S.tables.incident[4];
+  S.rules.push((table, rec) => { if (table === 'incident' && rec.priority === '1') rec.priority = '2'; });
+  try {
+    const plan = await pm.ok('sn_plan_change', { table: 'incident', sys_id: row.sys_id, record: { priority: 1, short_description: 'Printer out of toner on every floor' } });
+    const out = await pm.ok('sn_apply_plan', { plan_id: plan.plan_id });
+    assert.equal(out.matches_plan, false);
+    assert.deepEqual(out.mismatches, [{ field: 'priority', sent: '1', stored: '2' }]);
+    assert.deepEqual(out.stored, { priority: '2', short_description: 'Printer out of toner on every floor' });
+    assert.match(out.note, /something other than what was sent for: priority\. A business rule/);
+    const check = await main.ok('sn_check_plan', { plan_id: plan.plan_id });
+    assert.equal(check.in_sync, true, 'apply already reported what the rule stored, so it is not drift');
+  } finally { S.rules.length = 0; }
+});
+
+await test('a plan can create a record, and undo deletes it again', async () => {
+  const count = S.tables.incident.length;
+  const mark = S.requests.length;
+  const plan = await pm.ok('sn_plan_change', { table: 'incident', record: { short_description: 'Planned printer', priority: 4, u_nope: 'x' } });
+  assert.equal(plan.action, 'create');
+  assert.equal(plan.sys_id, null);
+  assert.equal(plan.base, null);
+  assert.deepEqual(plan.changes, [
+    { field: 'short_description', before: null, after: 'Planned printer' },
+    { field: 'priority', before: null, after: '4' },
+    { field: 'u_nope', before: null, after: 'x' },
+  ]);
+  assert.deepEqual(writesSince(mark), []);
+  assert.equal((await main.ok('sn_check_plan', { plan_id: plan.plan_id })).can_apply, true);
+
+  const out = await pm.ok('sn_apply_plan', { plan_id: plan.plan_id });
+  const [post] = writesSince(mark);
+  assert.equal(post.method, 'POST');
+  assert.deepEqual(post.body, { short_description: 'Planned printer', priority: '4', u_nope: 'x' });
+  assert.match(out.sys_id, /^[0-9a-f]{32}$/);
+  assert.deepEqual(out.mismatches, [{ field: 'u_nope', sent: 'x', stored: null }], 'a column the table does not have is flagged');
+  assert.equal(S.tables.incident.length, count + 1);
+  assert.equal(savedPlan(plan.plan_id).applied.sys_id, out.sys_id);
+  assert.equal((await main.ok('sn_check_plan', { plan_id: plan.plan_id })).in_sync, true);
+
+  const undo = await pm.ok('sn_undo_plan', { plan_id: plan.plan_id });
+  assert.equal(undo.deleted, true);
+  assert.equal(lastRequest().method, 'DELETE');
+  assert.equal(S.tables.incident.length, count);
+  const gone = await main.ok('sn_check_plan', { plan_id: plan.plan_id });
+  assert.equal(gone.record_exists, false);
+  assert.equal(gone.in_sync, true);
+});
+
+await test('a plan is refused while locked, for another instance, or when edited into something unsafe', async () => {
+  const row = S.tables.incident[3];
+  const plan = await pm.ok('sn_plan_change', { table: 'incident', sys_id: row.sys_id, record: { state: '1' } });
+  const writes = S.counts.writes;
+  const lock = path.join(PLANS, `${plan.plan_id}.lock`);
+  fs.writeFileSync(lock, '1\n');
+  await pm.fails('sn_apply_plan', { plan_id: plan.plan_id }, /already being applied or undone/);
+  fs.unlinkSync(lock);
+  const original = fs.readFileSync(plan.plan_file, 'utf8');
+  const edit = (changes) => fs.writeFileSync(plan.plan_file, JSON.stringify({ ...JSON.parse(original), ...changes }));
+  edit({ instance: 'https://elsewhere.service-now.com' });
+  await pm.fails('sn_apply_plan', { plan_id: plan.plan_id }, /made for https:\/\/elsewhere\.service-now\.com, but this server is set up for/);
+  edit({ table: '../sys_user' });
+  await pm.fails('sn_apply_plan', { plan_id: plan.plan_id }, /is not a plan this server can read/);
+  edit({ changes: [{ field: 'sys_mod_count', before: '0', after: '9' }] });
+  await pm.fails('sn_apply_plan', { plan_id: plan.plan_id }, /is not a plan this server can read/);
+  fs.writeFileSync(plan.plan_file, original);
+  assert.equal(S.counts.writes, writes, 'nothing was written');
+  assert.equal(row.state, '7');
+});
+
 await test('config file: found without env vars, allowWrite honoured, env wins', async () => {
   const bare = new Mcp(envFor(A, { SN_INSTANCE: undefined, SN_CLIENT_ID: undefined }), 'serve config only');
   assert.equal((await bare.ok('sn_instance_info', {})).instance, mock.url);
@@ -538,6 +784,11 @@ await test('config file: found without env vars, allowWrite honoured, env wins',
   const viaFile = new Mcp(envFor(F, { SN_INSTANCE: undefined, SN_CLIENT_ID: undefined }), 'serve config allowWrite');
   assert.equal((await viaFile.ok('sn_instance_info', {})).writes_allowed, true);
   await viaFile.close();
+  fs.writeFileSync(path.join(F, 'config.json'), JSON.stringify({ instance: mock.url, clientId: S.clientId, allowWrite: 'plan' }));
+  const planOnly = new Mcp(envFor(F, { SN_INSTANCE: undefined, SN_CLIENT_ID: undefined }), 'serve config plan');
+  assert.equal((await planOnly.ok('sn_instance_info', {})).write_mode, 'plan');
+  await planOnly.fails('sn_table_delete', VALID.sn_table_delete, /SN_ALLOW_WRITE=plan/);
+  await planOnly.close();
   const envWins = new Mcp(envFor(F, { SN_ALLOW_WRITE: '0' }), 'serve env wins');
   assert.equal((await envWins.ok('sn_instance_info', {})).writes_allowed, false);
   await envWins.fails('sn_table_delete', VALID.sn_table_delete, /SN_ALLOW_WRITE=1/);
@@ -595,10 +846,12 @@ await test('when the refresh is rejected the tool says to run login again', asyn
 await test('not signed in: every tool points at the login command', async () => {
   const before = S.counts.total;
   const anon = new Mcp(envFor(path.join(ROOT, 'empty'), { SN_ALLOW_WRITE: '1' }), 'serve signed out');
-  for (const name of TOOL_NAMES) {
+  for (const name of TOOL_NAMES.filter((tool) => !PLAN_ID_TOOLS.includes(tool))) {
     const out = await anon.fails(name, VALID[name], /Not signed in/);
     assert.ok(out.data.error.includes(`Run \`node ${SERVER} login\` first.`), out.data.error);
   }
+  // These look for the plan file first, and there is none here.
+  for (const name of PLAN_ID_TOOLS) await anon.fails(name, VALID[name], /There is no plan/);
   await anon.close();
   assert.equal(S.counts.total, before);
 });

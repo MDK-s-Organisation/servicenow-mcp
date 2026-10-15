@@ -34,6 +34,8 @@ const SELF_PATH = selfPath();
 const TABLE_RE = /^[a-z0-9_]+$/;
 const SYS_ID_RE = /^[0-9a-f]{32}$/i;
 const FIELD_RE = /^[A-Za-z0-9_.]+$/;
+const COLUMN_RE = /^[A-Za-z0-9_]+$/;
+const PLAN_ID_RE = /^\d{8}-\d{6}-[0-9a-f]{8}$/;
 
 function positiveInt(value) {
   const n = Number(value);
@@ -187,13 +189,12 @@ function loadConfig(overrides = {}, { requireInstance = true } = {}) {
   const clientSecret = String(env.SN_CLIENT_SECRET || '').trim();
   const redirectPort = parsePort(overrides.port || env.SN_REDIRECT_PORT || file.redirectPort || DEFAULT_PORT);
 
-  // Writes are allowed only when the value is exactly 1.
-  let allowWrite;
-  if (env.SN_ALLOW_WRITE !== undefined && env.SN_ALLOW_WRITE !== '') {
-    allowWrite = env.SN_ALLOW_WRITE === '1';
-  } else {
-    allowWrite = file.allowWrite === true || file.allowWrite === 1 || file.allowWrite === '1';
-  }
+  // Writes are off unless the value is exactly 1 (every write tool runs) or
+  // exactly plan (only sn_apply_plan runs, so every change is a reviewed plan).
+  const rawWrite = env.SN_ALLOW_WRITE !== undefined && env.SN_ALLOW_WRITE !== '' ? env.SN_ALLOW_WRITE : file.allowWrite;
+  let writeMode = 'off';
+  if (rawWrite === '1' || rawWrite === 1 || rawWrite === true) writeMode = 'all';
+  else if (rawWrite === 'plan') writeMode = 'plan';
 
   return {
     instance,
@@ -201,9 +202,13 @@ function loadConfig(overrides = {}, { requireInstance = true } = {}) {
     clientSecret,
     redirectPort,
     redirectUri: `http://localhost:${redirectPort}/callback`,
-    allowWrite,
+    allowWrite: writeMode !== 'off',
+    writeMode,
     configFile,
     tokenFile: tokenFilePath(),
+    // Plans live next to the config file, so two instances set up with two
+    // config files also keep their plans apart.
+    planDir: path.resolve(expandHome(env.SN_PLAN_DIR || path.join(path.dirname(configFile), 'plans'))),
   };
 }
 
@@ -662,10 +667,338 @@ function attachmentSummary(row) {
 }
 
 // ---------------------------------------------------------------------------
+// Plans: a change is saved with the before and after value of every field,
+// written only by sn_apply_plan, and can later be undone or checked for drift.
+// ---------------------------------------------------------------------------
+
+// Columns ServiceNow keeps up to date itself. They show whether a record
+// changed, and can never be part of a plan.
+const STAMP_FIELDS = ['sys_mod_count', 'sys_updated_on', 'sys_updated_by'];
+const SYSTEM_FIELDS = ['sys_id', 'sys_created_on', 'sys_created_by', ...STAMP_FIELDS];
+
+function newPlanId() {
+  // 2026-10-16T10:15:00.000Z becomes 20261016-101500, so plans sort by time.
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
+  return `${stamp}-${crypto.randomBytes(4).toString('hex')}`;
+}
+
+function argPlanId(value) {
+  if (typeof value !== 'string' || !PLAN_ID_RE.test(value)) {
+    throw new ToolError('plan_id must be a plan id from sn_plan_change, for example 20261016-101500-1a2b3c4d.');
+  }
+  return value;
+}
+
+// Every value is sent and compared as text, the way the Table API stores it.
+function planValue(field, value) {
+  if (value === null) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value))) return String(value);
+  throw new ToolError(`The value of ${field} must be text, a number, true or false, or null.`);
+}
+
+function argPlanRecord(value) {
+  const record = argRecord(value);
+  const fields = Object.keys(record);
+  if (!fields.length) throw new ToolError('record must name at least one field to change.');
+  const out = {};
+  for (const field of fields) {
+    if (!COLUMN_RE.test(field)) {
+      throw new ToolError(`${field} is not a column name. Use letters, digits and underscores only, for example short_description.`);
+    }
+    if (SYSTEM_FIELDS.includes(field)) throw new ToolError(`${field} is kept by ServiceNow itself and cannot be part of a plan.`);
+    out[field] = planValue(field, record[field]);
+  }
+  return out;
+}
+
+function planFilePath(cfg, id) {
+  return path.join(cfg.planDir, `${id}.json`);
+}
+
+function savePlan(cfg, plan) {
+  writePrivateFile(planFilePath(cfg, plan.plan_id), `${JSON.stringify(plan, null, 2)}\n`);
+}
+
+// Load a plan and check it again, because the file may have been edited by
+// hand since it was made.
+function loadPlan(cfg, id) {
+  const file = planFilePath(cfg, id);
+  const plan = readJsonFile(file);
+  if (!plan) throw new ToolError(`There is no plan ${id} in ${cfg.planDir}.`);
+  const bad = () => new ToolError(`${file} is not a plan this server can read. Make a new plan with sn_plan_change.`);
+  if (plan.format !== 1 || plan.plan_id !== id || typeof plan.instance !== 'string') throw bad();
+  if (!['create', 'update'].includes(plan.action) || !['planned', 'applied', 'undone'].includes(plan.status)) throw bad();
+  if (typeof plan.table !== 'string' || !TABLE_RE.test(plan.table)) throw bad();
+  if (plan.action === 'update') {
+    if (typeof plan.sys_id !== 'string' || !SYS_ID_RE.test(plan.sys_id)) throw bad();
+    if (!plan.base || typeof plan.base.sys_mod_count !== 'string' || typeof plan.base.sys_updated_on !== 'string') throw bad();
+  }
+  if (!Array.isArray(plan.changes) || !plan.changes.length) throw bad();
+  for (const change of plan.changes) {
+    if (!change || typeof change.field !== 'string' || !COLUMN_RE.test(change.field) || SYSTEM_FIELDS.includes(change.field)) throw bad();
+    if (typeof change.after !== 'string') throw bad();
+    if (plan.action === 'update' && typeof change.before !== 'string') throw bad();
+  }
+  if (plan.status !== 'planned') {
+    if (!plan.applied || typeof plan.applied.sys_id !== 'string' || !SYS_ID_RE.test(plan.applied.sys_id)) throw bad();
+  }
+  if (plan.status === 'undone' && (!plan.undone || typeof plan.undone.on !== 'string')) throw bad();
+  if (plan.instance !== cfg.instance) {
+    throw new ToolError(`Plan ${id} was made for ${plan.instance}, but this server is set up for ${cfg.instance}.`);
+  }
+  return plan;
+}
+
+// Only one apply or undo of a plan may run at a time, also across servers
+// that share the plans folder.
+function lockPlan(cfg, id) {
+  const lock = path.join(cfg.planDir, `${id}.lock`);
+  try {
+    fs.writeFileSync(lock, `${process.pid}\n`, { flag: 'wx', mode: 0o600 });
+  } catch (err) {
+    if (err && err.code === 'EEXIST') {
+      throw new ToolError(`Plan ${id} is already being applied or undone. If nothing is running, delete ${lock} and try again.`);
+    }
+    throw new ToolError(`Could not lock plan ${id}: ${err && err.code ? err.code : 'unknown error'}.`);
+  }
+  return () => {
+    try { fs.unlinkSync(lock); } catch { /* already gone */ }
+  };
+}
+
+// Read some fields of one record, plus the columns that show whether it
+// changed. Each value comes back as { display_value, value }.
+async function readPlanRecord(cfg, table, sysId, fields) {
+  const { data } = await snJson(cfg, 'GET', `/api/now/table/${table}/${sysId}`, {
+    query: {
+      sysparm_fields: [...new Set([...fields, ...STAMP_FIELDS])].join(','),
+      sysparm_display_value: 'all',
+      sysparm_exclude_reference_link: 'true',
+    },
+  });
+  const row = data ? data.result : null;
+  return row && typeof row === 'object' && !Array.isArray(row) ? row : {};
+}
+
+// The same, but a record that is gone gives null instead of an error.
+async function readPlanRecordIfThere(cfg, table, sysId, fields) {
+  try {
+    return await readPlanRecord(cfg, table, sysId, fields);
+  } catch (err) {
+    if (err instanceof ToolError && err.status === 404) return null;
+    throw err;
+  }
+}
+
+// The stored value of a field, or undefined when ServiceNow did not return it.
+function storedValue(row, field) {
+  if (!Object.prototype.hasOwnProperty.call(row, field)) return undefined;
+  const value = row[field];
+  if (value && typeof value === 'object') return value.value === undefined || value.value === null ? '' : String(value.value);
+  return value === undefined || value === null ? '' : String(value);
+}
+
+function shownValue(row, field) {
+  const value = row[field];
+  if (value && typeof value === 'object' && value.display_value !== undefined && value.display_value !== null) {
+    return String(value.display_value);
+  }
+  return undefined;
+}
+
+function recordStamp(row) {
+  return {
+    sys_mod_count: storedValue(row, 'sys_mod_count') ?? '',
+    sys_updated_on: storedValue(row, 'sys_updated_on') ?? '',
+    sys_updated_by: storedValue(row, 'sys_updated_by') ?? '',
+  };
+}
+
+function stampMoved(then, now) {
+  return then.sys_mod_count !== now.sys_mod_count || then.sys_updated_on !== now.sys_updated_on;
+}
+
+function changedBy(now) {
+  return `${now.sys_updated_by || 'someone'} at ${now.sys_updated_on || 'an unknown time'}`;
+}
+
+// What the planned fields should hold now that the plan was applied or undone.
+function expectedValues(plan) {
+  if (plan.status === 'undone') {
+    return plan.undone.values || Object.fromEntries(plan.changes.map((c) => [c.field, c.before]));
+  }
+  return plan.applied.values || Object.fromEntries(plan.changes.map((c) => [c.field, c.after]));
+}
+
+function driftOf(row, plan, expected) {
+  const drift = [];
+  for (const { field } of plan.changes) {
+    const now = storedValue(row, field) ?? null;
+    const want = expected[field] ?? null;
+    if (now !== want) drift.push({ field, expected: want, now });
+  }
+  return drift;
+}
+
+function describeDrift(drift) {
+  return drift.map((d) => `${d.field} (expected ${JSON.stringify(d.expected)}, now ${JSON.stringify(d.now)})`).join(', ');
+}
+
+// Read the record back after a write and compare it with what was sent.
+async function readBack(cfg, plan, sysId, sent) {
+  const row = await readPlanRecord(cfg, plan.table, sysId, Object.keys(sent));
+  const values = {};
+  const mismatches = [];
+  for (const [field, value] of Object.entries(sent)) {
+    const stored = storedValue(row, field) ?? null;
+    values[field] = stored;
+    if (stored !== value) mismatches.push({ field, sent: value, stored });
+  }
+  return { ...recordStamp(row), values, mismatches };
+}
+
+function mismatchNote(mismatches) {
+  if (!mismatches.length) return 'ServiceNow stored every value as sent.';
+  const fields = mismatches.map((m) => m.field).join(', ');
+  return `ServiceNow stored something other than what was sent for: ${fields}. A business rule, a data policy or a reference lookup may have changed it, or the field may not exist on this table.`;
+}
+
+// A write that failed leaves the plan as it was, with the reason kept in it.
+function writeFailed(cfg, plan, err, what) {
+  let message = err instanceof ToolError ? err.message : `Unexpected error: ${err && err.message ? err.message : String(err)}`;
+  if (err && err.network) message += ` It is not known whether ServiceNow made the change. Run sn_check_plan before trying to ${what} again.`;
+  plan.last_error = { on: new Date().toISOString(), during: what, error: scrubError(message) };
+  savePlan(cfg, plan);
+  return err instanceof ToolError ? new ToolError(message, { status: err.status, detail: err.detail }) : err;
+}
+
+async function applyPlan(cfg, plan) {
+  const id = plan.plan_id;
+  const body = Object.fromEntries(plan.changes.map((c) => [c.field, c.after]));
+  let sysId = plan.sys_id;
+  try {
+    if (plan.action === 'update') {
+      const row = await readPlanRecordIfThere(cfg, plan.table, sysId, Object.keys(body));
+      if (!row) throw new ToolError(`${plan.table} ${sysId} no longer exists, so nothing was written.`);
+      const now = recordStamp(row);
+      if (stampMoved(plan.base, now)) {
+        const moved = plan.changes
+          .filter((c) => storedValue(row, c.field) !== c.before)
+          .map((c) => `${c.field} (was ${JSON.stringify(c.before)}, now ${JSON.stringify(storedValue(row, c.field) ?? null)})`);
+        const which = moved.length ? ` Planned fields that changed: ${moved.join(', ')}.` : ' None of the planned fields changed, but the plan was made for the record as it was.';
+        throw new ToolError(`${plan.table} ${sysId} was changed by ${changedBy(now)} after this plan was made, so nothing was written.${which} Make a new plan with sn_plan_change.`);
+      }
+      // The Table API has no conditional update, so a change that lands
+      // between the read above and this write is not caught here. The read
+      // back below and sn_check_plan show it.
+      await snJson(cfg, 'PATCH', `/api/now/table/${plan.table}/${sysId}`, {
+        query: { sysparm_exclude_reference_link: 'true' },
+        body: JSON.stringify(body),
+      });
+    } else {
+      const { data } = await snJson(cfg, 'POST', `/api/now/table/${plan.table}`, {
+        query: { sysparm_exclude_reference_link: 'true' },
+        body: JSON.stringify(body),
+      });
+      sysId = data && data.result ? asText(data.result.sys_id) : '';
+      if (!SYS_ID_RE.test(sysId)) {
+        throw new ToolError(`ServiceNow accepted the new ${plan.table} record but did not return its sys_id. Look for it in the table before applying this plan again.`);
+      }
+      sysId = sysId.toLowerCase();
+    }
+  } catch (err) {
+    throw writeFailed(cfg, plan, err, 'apply');
+  }
+
+  // Saved before the read back, so a failed read can never lead to a second write.
+  plan.status = 'applied';
+  plan.last_error = null;
+  plan.applied = { on: new Date().toISOString(), sys_id: sysId, values: null, mismatches: null };
+  savePlan(cfg, plan);
+  let check;
+  try {
+    check = await readBack(cfg, plan, sysId, body);
+  } catch (err) {
+    throw new ToolError(`Plan ${id} was written to ServiceNow, but reading the record back failed: ${err.message} Run sn_check_plan to see what was stored.`);
+  }
+  plan.applied = { ...plan.applied, ...check };
+  savePlan(cfg, plan);
+  const undo = plan.action === 'create' ? 'To delete the new record again' : 'To put the old values back';
+  return {
+    plan_id: id,
+    status: plan.status,
+    action: plan.action,
+    table: plan.table,
+    sys_id: sysId,
+    matches_plan: check.mismatches.length === 0,
+    stored: check.values,
+    mismatches: check.mismatches,
+    note: `${mismatchNote(check.mismatches)} ${undo}, call sn_undo_plan with this plan_id.`,
+  };
+}
+
+async function undoPlan(cfg, plan) {
+  const id = plan.plan_id;
+  const sysId = plan.applied.sys_id;
+  const row = await readPlanRecordIfThere(cfg, plan.table, sysId, plan.changes.map((c) => c.field));
+  if (!row) throw new ToolError(`${plan.table} ${sysId} no longer exists, so there is nothing to undo.`);
+  const now = recordStamp(row);
+  const drift = driftOf(row, plan, expectedValues(plan));
+  const out = { plan_id: id, status: 'undone', action: plan.action, table: plan.table, sys_id: sysId };
+
+  if (plan.action === 'create') {
+    // Deleting a record someone has worked on since would lose their work.
+    const changed = typeof plan.applied.sys_mod_count === 'string' ? stampMoved(plan.applied, now) : drift.length > 0;
+    if (changed) {
+      throw new ToolError(`Not undone. ${plan.table} ${sysId} was changed by ${changedBy(now)} after this plan created it, and deleting it would lose that change.`);
+    }
+    try {
+      await snJson(cfg, 'DELETE', `/api/now/table/${plan.table}/${sysId}`);
+    } catch (err) {
+      throw writeFailed(cfg, plan, err, 'undo');
+    }
+    plan.status = 'undone';
+    plan.last_error = null;
+    plan.undone = { on: new Date().toISOString(), deleted: true };
+    savePlan(cfg, plan);
+    return { ...out, deleted: true, note: `Deleted ${plan.table} ${sysId}, the record this plan created.` };
+  }
+
+  // Only the planned fields matter. Changes to other fields are left alone.
+  if (drift.length) {
+    throw new ToolError(`Not undone. These fields were changed by ${changedBy(now)} after the plan was applied, and undoing would overwrite that: ${describeDrift(drift)}.`);
+  }
+  const body = Object.fromEntries(plan.changes.map((c) => [c.field, c.before]));
+  try {
+    await snJson(cfg, 'PATCH', `/api/now/table/${plan.table}/${sysId}`, {
+      query: { sysparm_exclude_reference_link: 'true' },
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    throw writeFailed(cfg, plan, err, 'undo');
+  }
+  plan.status = 'undone';
+  plan.last_error = null;
+  plan.undone = { on: new Date().toISOString(), values: null, mismatches: null };
+  savePlan(cfg, plan);
+  let check;
+  try {
+    check = await readBack(cfg, plan, sysId, body);
+  } catch (err) {
+    throw new ToolError(`Plan ${id} was undone in ServiceNow, but reading the record back failed: ${err.message} Run sn_check_plan to see what was stored.`);
+  }
+  plan.undone = { ...plan.undone, ...check };
+  savePlan(cfg, plan);
+  return { ...out, matches_before: check.mismatches.length === 0, stored: check.values, mismatches: check.mismatches, note: mismatchNote(check.mismatches) };
+}
+
+// ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------
 
 const WRITE_NOTE = 'This is a write tool. It refuses to run unless the server was started with SN_ALLOW_WRITE=1.';
+const PLAN_WRITE_NOTE = 'This is a write tool. It refuses to run unless the server was started with SN_ALLOW_WRITE=1 or SN_ALLOW_WRITE=plan.';
 
 const SCHEMA_TABLE = { type: 'string', description: 'Table name, lowercase letters, digits and underscores only. Example: incident.' };
 const SCHEMA_SYS_ID = { type: 'string', description: 'The sys_id of the record: 32 hex characters.' };
@@ -675,12 +1008,13 @@ const SCHEMA_DISPLAY = {
   enum: ['true', 'false', 'all'],
   description: 'false returns stored values (the default), true returns display values such as names for references, all returns both.',
 };
+const SCHEMA_PLAN_ID = { type: 'string', description: 'The plan_id that sn_plan_change returned. Example: 20261016-101500-1a2b3c4d.' };
 
 const TOOLS = [
   {
     name: 'sn_instance_info',
     write: false,
-    description: 'Show which ServiceNow instance this server talks to, who is signed in, the instance build tag, and whether write tools are allowed. A good first call to check that the connection works.',
+    description: 'Show which ServiceNow instance this server talks to, who is signed in, the instance build tag, and whether write tools are allowed. write_mode is off, plan (writes only through sn_apply_plan) or all. A good first call to check that the connection works.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
     annotations: { readOnlyHint: true },
     async run(args, cfg) {
@@ -691,6 +1025,7 @@ const TOOLS = [
         user: { name: user.name, user_name: user.user_name, sys_id: user.sys_id },
         build,
         writes_allowed: cfg.allowWrite,
+        write_mode: cfg.writeMode,
       };
     },
   },
@@ -1010,6 +1345,188 @@ const TOOLS = [
       return { deleted: true, sys_id: sysId };
     },
   },
+  {
+    name: 'sn_plan_change',
+    write: false,
+    description: 'Propose a change to one record without writing it. Give sys_id to change an existing record, or leave it out to plan a new one. The server reads the current values, saves a plan with the before and after value of every field, and returns it with a plan_id. Only reads reach ServiceNow. Give reference fields as sys_ids and choice fields as stored values, the form sn_table_get returns, so the plan compares like with like. Show the changes to the user and call sn_apply_plan only after they agree.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        table: SCHEMA_TABLE,
+        sys_id: { type: 'string', description: 'The sys_id of the record to change: 32 hex characters. Leave out to plan a new record.' },
+        record: { type: 'object', additionalProperties: true, description: 'Field names and the values they should have. Example: {"state": "2", "assigned_to": "<sys_id of the user>"}.' },
+        reason: { type: 'string', description: 'Why the change is made. Kept in the plan for whoever reviews it.' },
+      },
+      required: ['table', 'record'],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false },
+    async run(args, cfg) {
+      const table = argTable(args.table);
+      const sysId = args.sys_id === undefined || args.sys_id === null ? null : argSysId(args.sys_id);
+      const record = argPlanRecord(args.record);
+      const reason = (argText(args.reason, 'reason') || '').trim();
+      const fields = Object.keys(record);
+      const changes = [];
+      const noChange = [];
+      let base = null;
+      if (sysId) {
+        const row = await readPlanRecord(cfg, table, sysId, fields);
+        const missing = fields.filter((field) => storedValue(row, field) === undefined);
+        if (missing.length) {
+          throw new ToolError(`ServiceNow did not return ${missing.join(', ')} for ${table}. The field may not exist on that table, or you may not be allowed to read it. Check the names with sn_table_schema. No plan was saved.`);
+        }
+        for (const field of fields) {
+          const before = storedValue(row, field);
+          if (before === record[field]) {
+            noChange.push(field);
+            continue;
+          }
+          const change = { field, before, after: record[field] };
+          const shown = shownValue(row, field);
+          if (shown !== undefined && shown !== before) change.before_display = shown;
+          changes.push(change);
+        }
+        if (!changes.length) {
+          throw new ToolError(`Every field already has the planned value on ${table} ${sysId}, so there is nothing to change. No plan was saved.`);
+        }
+        base = recordStamp(row);
+      } else {
+        // This only checks that the table exists and can be read. The fields of
+        // a new record are checked when it is read back after sn_apply_plan.
+        await snJson(cfg, 'GET', `/api/now/table/${table}`, { query: { sysparm_limit: 1, sysparm_fields: 'sys_id' } });
+        for (const field of fields) changes.push({ field, before: null, after: record[field] });
+      }
+      const plan = {
+        plan_id: newPlanId(),
+        format: 1,
+        status: 'planned',
+        instance: cfg.instance,
+        created_on: new Date().toISOString(),
+        action: sysId ? 'update' : 'create',
+        table,
+        sys_id: sysId,
+        reason: reason || null,
+        changes,
+        no_change: noChange,
+        base,
+        applied: null,
+        undone: null,
+        last_error: null,
+      };
+      savePlan(cfg, plan);
+      return {
+        ...plan,
+        plan_file: planFilePath(cfg, plan.plan_id),
+        note: 'Nothing was sent to ServiceNow. Show these changes to the user, and call sn_apply_plan with this plan_id only after they agree.',
+      };
+    },
+  },
+  {
+    name: 'sn_apply_plan',
+    write: 'plan',
+    description: `Write a plan made by sn_plan_change, only after the user has agreed to its changes. For an existing record it first reads the record again and refuses if anything changed since the plan was made. It sends exactly the planned fields, then reads the record back and reports any field ServiceNow stored differently, for example because a business rule changed it. If ServiceNow refuses the write, nothing changes and the plan stays unapplied with the reason kept in it. ${PLAN_WRITE_NOTE}`,
+    inputSchema: { type: 'object', properties: { plan_id: SCHEMA_PLAN_ID }, required: ['plan_id'], additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: true },
+    async run(args, cfg) {
+      const id = argPlanId(args.plan_id);
+      loadPlan(cfg, id); // fails early when there is no such plan
+      const unlock = lockPlan(cfg, id);
+      try {
+        const plan = loadPlan(cfg, id); // again, now that nobody else can change it
+        if (plan.status === 'applied') {
+          throw new ToolError(`Plan ${id} was already applied on ${plan.applied.on}. Use sn_check_plan to see whether the record still matches.`);
+        }
+        if (plan.status === 'undone') {
+          throw new ToolError(`Plan ${id} was applied and then undone. Make a new plan to make the change again.`);
+        }
+        return await applyPlan(cfg, plan);
+      } finally {
+        unlock();
+      }
+    },
+  },
+  {
+    name: 'sn_undo_plan',
+    write: 'plan',
+    description: `Undo a plan that sn_apply_plan wrote. For a changed record it puts back the values the planned fields had before. For a new record it deletes that record. It refuses if someone changed those fields (or the new record) after the plan was applied, so it never overwrites later work. Fields the plan did not touch are left alone. ${PLAN_WRITE_NOTE}`,
+    inputSchema: { type: 'object', properties: { plan_id: SCHEMA_PLAN_ID }, required: ['plan_id'], additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: true },
+    async run(args, cfg) {
+      const id = argPlanId(args.plan_id);
+      loadPlan(cfg, id);
+      const unlock = lockPlan(cfg, id);
+      try {
+        const plan = loadPlan(cfg, id);
+        if (plan.status === 'planned') throw new ToolError(`Plan ${id} has not been applied, so there is nothing to undo.`);
+        if (plan.status === 'undone') throw new ToolError(`Plan ${id} was already undone on ${plan.undone.on}.`);
+        return await undoPlan(cfg, plan);
+      } finally {
+        unlock();
+      }
+    },
+  },
+  {
+    name: 'sn_check_plan',
+    write: false,
+    description: 'Compare a saved plan with the record as it is now. Before the plan is applied it says whether it can still be applied, or whether the record changed since the plan was made. After it is applied or undone it reports drift: each planned field that no longer holds the value sn_apply_plan or sn_undo_plan left there, and who changed the record last. Only reads.',
+    inputSchema: { type: 'object', properties: { plan_id: SCHEMA_PLAN_ID }, required: ['plan_id'], additionalProperties: false },
+    annotations: { readOnlyHint: true },
+    async run(args, cfg) {
+      const id = argPlanId(args.plan_id);
+      const plan = loadPlan(cfg, id);
+      const fields = plan.changes.map((c) => c.field);
+      const sysId = plan.status === 'planned' ? plan.sys_id : plan.applied.sys_id;
+      const out = { plan_id: id, status: plan.status, action: plan.action, table: plan.table, sys_id: sysId };
+
+      if (plan.status === 'planned') {
+        if (plan.action === 'create') {
+          return { ...out, can_apply: true, note: 'A new record has nothing to compare with until the plan is applied.' };
+        }
+        const row = await readPlanRecordIfThere(cfg, plan.table, sysId, fields);
+        if (!row) return { ...out, record_exists: false, can_apply: false, note: 'The record no longer exists.' };
+        const now = recordStamp(row);
+        const moved = stampMoved(plan.base, now);
+        const differences = plan.changes
+          .filter((c) => storedValue(row, c.field) !== c.before)
+          .map((c) => ({ field: c.field, planned_from: c.before, now: storedValue(row, c.field) ?? null }));
+        return {
+          ...out,
+          record_exists: true,
+          can_apply: !moved,
+          changed_since_plan: moved,
+          differences,
+          last_updated_by: now.sys_updated_by,
+          last_updated_on: now.sys_updated_on,
+          note: moved ? 'The record changed after the plan was made, so sn_apply_plan will refuse it. Make a new plan.' : 'The record is as it was when the plan was made.',
+        };
+      }
+
+      const row = await readPlanRecordIfThere(cfg, plan.table, sysId, fields);
+      if (plan.status === 'undone' && plan.action === 'create') {
+        return { ...out, record_exists: Boolean(row), in_sync: !row, drift: [], note: row ? 'The record this plan created and then deleted exists again.' : 'The record this plan created is still deleted.' };
+      }
+      if (!row) return { ...out, record_exists: false, in_sync: false, drift: [], note: 'The record no longer exists.' };
+      const now = recordStamp(row);
+      const drift = driftOf(row, plan, expectedValues(plan));
+      const since = plan.status === 'undone' ? plan.undone : plan.applied;
+      const step = plan.status === 'undone' ? 'undo' : 'apply';
+      const changed = typeof since.sys_mod_count === 'string' ? stampMoved(since, now) : null;
+      let note = 'Every planned field still holds the value the plan left there.';
+      if (drift.length) note = 'Some planned fields were changed after the plan ran. See drift.';
+      else if (changed) note = 'The record was changed after the plan ran, but not in the planned fields.';
+      return {
+        ...out,
+        record_exists: true,
+        in_sync: drift.length === 0,
+        drift,
+        [`changed_since_${step}`]: changed,
+        last_updated_by: now.sys_updated_by,
+        last_updated_on: now.sys_updated_on,
+        note,
+      };
+    },
+  },
 ];
 
 const TOOLS_BY_NAME = new Map(TOOLS.map((tool) => [tool.name, tool]));
@@ -1043,8 +1560,12 @@ async function callTool(params) {
       throw new ToolError('The tool arguments must be an object.');
     }
     const cfg = loadConfig();
-    if (tool.write && !cfg.allowWrite) {
-      throw new ToolError(`Writes are turned off, so ${tool.name} did nothing. It only runs when SN_ALLOW_WRITE=1 is set where this server is registered.`);
+    if (tool.write && cfg.writeMode === 'off') {
+      const needs = tool.write === 'plan' ? 'SN_ALLOW_WRITE=1 or SN_ALLOW_WRITE=plan is' : 'SN_ALLOW_WRITE=1 is';
+      throw new ToolError(`Writes are turned off, so ${tool.name} did nothing. It only runs when ${needs} set where this server is registered.`);
+    }
+    if (tool.write === true && cfg.writeMode === 'plan') {
+      throw new ToolError(`This server only writes through reviewed plans (SN_ALLOW_WRITE=plan), so ${tool.name} did nothing. Creates and updates of records can go through sn_plan_change and sn_apply_plan.`);
     }
     for (const key of Object.keys(args)) {
       if (!Object.prototype.hasOwnProperty.call(tool.inputSchema.properties, key)) {
@@ -1065,7 +1586,7 @@ async function callTool(params) {
 // MCP over stdio: newline delimited JSON-RPC 2.0
 // ---------------------------------------------------------------------------
 
-const INSTRUCTIONS = 'servicenow-mcp gives access to one ServiceNow instance through its REST API: query tables, read single records, look up the columns of a table, and list or download attachments. It is read-only unless the server was started with SN_ALLOW_WRITE=1; without that the create, update, delete and upload tools refuse to run. If a tool reports that nobody is signed in, ask the user to run the login command shown in the error.';
+const INSTRUCTIONS = 'servicenow-mcp gives access to one ServiceNow instance through its REST API: query tables, read single records, look up the columns of a table, and list or download attachments. It is read-only unless the server was started with SN_ALLOW_WRITE=1 or SN_ALLOW_WRITE=plan. To change a record, prefer the reviewed path: sn_plan_change saves a before and after diff as a plan without writing anything, show that diff to the user, and call sn_apply_plan only after they agree. sn_undo_plan puts the old values back, and sn_check_plan reports drift later. With SN_ALLOW_WRITE=plan the direct create, update, delete and upload tools refuse to run. If a tool reports that nobody is signed in, ask the user to run the login command shown in the error.';
 
 function rpcError(id, code, message) {
   return { jsonrpc: '2.0', id, error: { code, message } };
@@ -1400,9 +1921,11 @@ function cmdStatus() {
     say('Signed in:       yes');
     say(`Token expires:   ${describeExpiry(tokens)}`);
   }
-  say(`Writes allowed:  ${cfg.allowWrite ? 'yes (SN_ALLOW_WRITE=1)' : 'no (read-only)'}`);
+  const writes = { off: 'no (read-only)', plan: 'only through sn_apply_plan (SN_ALLOW_WRITE=plan)', all: 'yes (SN_ALLOW_WRITE=1)' };
+  say(`Writes allowed:  ${writes[cfg.writeMode]}`);
   say(`Token file:      ${cfg.tokenFile}`);
   say(`Config file:     ${cfg.configFile}`);
+  say(`Plans folder:    ${cfg.planDir}`);
   if (!tokens) say(`To sign in run:  ${loginCommand()} --instance <url> --client-id <id>`);
   return 0;
 }
